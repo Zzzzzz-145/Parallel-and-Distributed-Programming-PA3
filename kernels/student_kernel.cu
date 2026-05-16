@@ -11,8 +11,8 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
                               float *A, float *B, float beta, float *C) {
     // 保持 V3 原本 shared memory layout
     // 這裡先不要改成 A transpose，也先不要只 padding B
-    __shared__ float As[BM][BK + 1];
-    __shared__ float Bs[BK][BN + 1];
+    __shared__ float As[BM][BK + 4];
+    __shared__ float Bs[BK][BN ];
 
     int tid = threadIdx.x;        // 0..255
 
