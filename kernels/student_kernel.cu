@@ -14,16 +14,27 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
     __shared__ float As[BM][BK + 1];
     __shared__ float Bs[BK][BN + 1];
 
-    int tx = threadIdx.x;  // 0..15
-    int ty = threadIdx.y;  // 0..15
+    int tid = threadIdx.x;        // 0..255
 
-    int tid = ty * blockDim.x + tx;    // 0..255
-
+    int warpId = tid >> 5;        // 0..7
+    int lane   = tid & 31;        // 0..31
+    
     int blockRow = blockIdx.y * BM;
     int blockCol = blockIdx.x * BN;
-
-    int localRow = ty * TM;  // 0, 4, 8, ..., 60
-    int localCol = tx * TN;  // 0, 4, 8, ..., 60
+    
+    // explicit warp-level tiling
+    // each warp computes a 16x32 sub-tile
+    int warpTileRow = (warpId >> 1) * 16;  // 0, 16, 32, 48
+    int warpTileCol = (warpId & 1) * 32;   // 0 or 32
+    
+    // within each warp:
+    // laneRow = 0..3
+    // laneCol = 0..7
+    int laneRow = lane >> 3;
+    int laneCol = lane & 7;
+    
+    int localRow = warpTileRow + laneRow * TM;
+    int localCol = warpTileCol + laneCol * TN;
 
     float acc[TM][TN];
 
@@ -120,20 +131,27 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
 
     // 保持 V3 原本 scalar C store
     // 先不要加入 float4 C load/store，這樣才能單獨測 A/B float4 load 的效果。
-#pragma unroll
+    #pragma unroll
     for (int i = 0; i < TM; i++) {
-#pragma unroll
-        for (int j = 0; j < TN; j++) {
-            int row = globalRow + i;
-            int col = globalCol + j;
-            C[row * N + col] = alpha * acc[i][j] + beta * C[row * N + col];
-        }
+        float4 oldC = reinterpret_cast<const float4*>(
+            C + (globalRow + i) * N + globalCol
+        )[0];
+    
+        float4 out;
+        out.x = alpha * acc[i][0] + beta * oldC.x;
+        out.y = alpha * acc[i][1] + beta * oldC.y;
+        out.z = alpha * acc[i][2] + beta * oldC.z;
+        out.w = alpha * acc[i][3] + beta * oldC.w;
+    
+        reinterpret_cast<float4*>(
+            C + (globalRow + i) * N + globalCol
+        )[0] = out;
     }
 }
 
 void runStudent(int M, int N, int K, float alpha,
                 float *A, float *B, float beta, float *C) {
-    dim3 block(BN / TN, BM / TM);  // 16 x 16 = 256 threads
+    dim3 block(256);
     dim3 grid(N / BN, M / BM);
 
     StudentKernel<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
