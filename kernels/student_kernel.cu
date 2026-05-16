@@ -11,8 +11,8 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
                               float *A, float *B, float beta, float *C) {
     // 保持 V3 原本 shared memory layout
     // 這裡先不要改成 A transpose，也先不要只 padding B
-    __shared__ float As[BM][BK + 4];
-    __shared__ float Bs[BK][BN ];
+    __shared__ float As[2][BM][BK + 4];
+    __shared__ float Bs[2][BK][BN];
 
     int tid = threadIdx.x;        // 0..255
 
@@ -46,85 +46,137 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
         }
     }
 
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        // ---------------------------------------------------------------------
-        // float4 load A tile
-        //
-        // A tile: BM x BK = 64 x 16 = 1024 floats
-        // float4 groups: 1024 / 4 = 256
-        // 256 threads => each thread loads exactly one float4
-        //
-        // A is row-major, so A[row][k0 + c ... k0 + c+3] is contiguous.
-        // ---------------------------------------------------------------------
-        {
-            int vecId = tid;               // 0..255
-            int r = vecId / (BK / 4);      // 0..63
-            int c4 = vecId % (BK / 4);     // 0..3
-            int c = c4 * 4;                // 0, 4, 8, 12
+// -----------------------------------------------------------------------------
+// Double-buffered shared memory pipeline
+// -----------------------------------------------------------------------------
+// Buffer 0: current tile
+// Buffer 1: next tile
+//
+// Strategy:
+// 1. Load tile 0 into shared buffer 0.
+// 2. For each k0:
+//    - issue global load for next tile into registers
+//    - compute current shared tile
+//    - store next registers into the other shared buffer
+//    - sync and swap buffers
+// -----------------------------------------------------------------------------
 
-            const float4 a4 = reinterpret_cast<const float4*>(
-                A + (blockRow + r) * K + (k0 + c)
-            )[0];
+int readBuf = 0;
 
-            As[r][c + 0] = a4.x;
-            As[r][c + 1] = a4.y;
-            As[r][c + 2] = a4.z;
-            As[r][c + 3] = a4.w;
-        }
+// preload k0 = 0 into shared buffer 0
+{
+    int vecId = tid;
 
-        // ---------------------------------------------------------------------
-        // float4 load B tile
-        //
-        // B tile: BK x BN = 16 x 64 = 1024 floats
-        // float4 groups: 1024 / 4 = 256
-        // 256 threads => each thread loads exactly one float4
-        //
-        // B is row-major, so B[k0 + r][col ... col+3] is contiguous.
-        // ---------------------------------------------------------------------
-        {
-            int vecId = tid;               // 0..255
-            int r = vecId / (BN / 4);      // 0..15
-            int c4 = vecId % (BN / 4);     // 0..15
-            int c = c4 * 4;                // 0, 4, 8, ..., 60
+    // A tile: BM x BK = 64 x 16 = 1024 floats = 256 float4
+    int ar = vecId / (BK / 4);      // 0..63
+    int ac4 = vecId % (BK / 4);     // 0..3
+    int ac = ac4 * 4;               // 0,4,8,12
 
-            const float4 b4 = reinterpret_cast<const float4*>(
-                B + (k0 + r) * N + (blockCol + c)
-            )[0];
+    const float4 a4 = reinterpret_cast<const float4*>(
+        A + (blockRow + ar) * K + ac
+    )[0];
 
-            Bs[r][c + 0] = b4.x;
-            Bs[r][c + 1] = b4.y;
-            Bs[r][c + 2] = b4.z;
-            Bs[r][c + 3] = b4.w;
-        }
+    As[0][ar][ac + 0] = a4.x;
+    As[0][ar][ac + 1] = a4.y;
+    As[0][ar][ac + 2] = a4.z;
+    As[0][ar][ac + 3] = a4.w;
 
-        __syncthreads();
+    // B tile: BK x BN = 16 x 64 = 1024 floats = 256 float4
+    int br = vecId / (BN / 4);      // 0..15
+    int bc4 = vecId % (BN / 4);     // 0..15
+    int bc = bc4 * 4;               // 0,4,...,60
+
+    const float4 b4 = reinterpret_cast<const float4*>(
+        B + br * N + (blockCol + bc)
+    )[0];
+
+    Bs[0][br][bc + 0] = b4.x;
+    Bs[0][br][bc + 1] = b4.y;
+    Bs[0][br][bc + 2] = b4.z;
+    Bs[0][br][bc + 3] = b4.w;
+}
+
+__syncthreads();
+
+for (int k0 = 0; k0 < K; k0 += BK) {
+    int nextK = k0 + BK;
+    int writeBuf = readBuf ^ 1;
+    bool hasNext = nextK < K;
+
+    // -------------------------------------------------------------------------
+    // Issue next tile global loads into registers.
+    // These values are independent of current compute, so compiler may schedule
+    // the global loads ahead and overlap part of the latency with FFMA work.
+    // -------------------------------------------------------------------------
+    float4 nextA4;
+    float4 nextB4;
+
+    int vecId = tid;
+
+    int ar = vecId / (BK / 4);
+    int ac4 = vecId % (BK / 4);
+    int ac = ac4 * 4;
+
+    int br = vecId / (BN / 4);
+    int bc4 = vecId % (BN / 4);
+    int bc = bc4 * 4;
+
+    if (hasNext) {
+        nextA4 = reinterpret_cast<const float4*>(
+            A + (blockRow + ar) * K + (nextK + ac)
+        )[0];
+
+        nextB4 = reinterpret_cast<const float4*>(
+            B + (nextK + br) * N + (blockCol + bc)
+        )[0];
+    }
+
+    // -------------------------------------------------------------------------
+    // Compute current tile from shared memory
+    // -------------------------------------------------------------------------
+#pragma unroll
+    for (int kk = 0; kk < BK; kk++) {
+        float aFrag[TM];
+        float bFrag[TN];
 
 #pragma unroll
-        for (int kk = 0; kk < BK; kk++) {
-            float aFrag[TM];
-            float bFrag[TN];
+        for (int i = 0; i < TM; i++) {
+            aFrag[i] = As[readBuf][localRow + i][kk];
+        }
 
 #pragma unroll
-            for (int i = 0; i < TM; i++) {
-                aFrag[i] = As[localRow + i][kk];
-            }
+        for (int j = 0; j < TN; j++) {
+            bFrag[j] = Bs[readBuf][kk][localCol + j];
+        }
 
+#pragma unroll
+        for (int i = 0; i < TM; i++) {
 #pragma unroll
             for (int j = 0; j < TN; j++) {
-                bFrag[j] = Bs[kk][localCol + j];
-            }
-
-#pragma unroll
-            for (int i = 0; i < TM; i++) {
-#pragma unroll
-                for (int j = 0; j < TN; j++) {
-                    acc[i][j] = fmaf(aFrag[i], bFrag[j], acc[i][j]);
-                }
+                acc[i][j] = fmaf(aFrag[i], bFrag[j], acc[i][j]);
             }
         }
-
-        __syncthreads();
     }
+
+    // -------------------------------------------------------------------------
+    // Store prefetched next tile from registers into the other shared buffer
+    // -------------------------------------------------------------------------
+    if (hasNext) {
+        As[writeBuf][ar][ac + 0] = nextA4.x;
+        As[writeBuf][ar][ac + 1] = nextA4.y;
+        As[writeBuf][ar][ac + 2] = nextA4.z;
+        As[writeBuf][ar][ac + 3] = nextA4.w;
+
+        Bs[writeBuf][br][bc + 0] = nextB4.x;
+        Bs[writeBuf][br][bc + 1] = nextB4.y;
+        Bs[writeBuf][br][bc + 2] = nextB4.z;
+        Bs[writeBuf][br][bc + 3] = nextB4.w;
+    }
+
+    __syncthreads();
+
+    readBuf ^= 1;
+}
 
     int globalRow = blockRow + localRow;
     int globalCol = blockCol + localCol;
