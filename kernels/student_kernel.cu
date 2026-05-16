@@ -9,7 +9,9 @@
 
 __global__ void StudentKernel(int M, int N, int K, float alpha,
                               float *A, float *B, float beta, float *C) {
-    __shared__ float As[BM][BK + 1];   // +1 padding helps reduce bank conflicts
+    // 保持 V3 原本 shared memory layout
+    // 這裡先不要改成 A transpose，也先不要只 padding B
+    __shared__ float As[BM][BK + 1];
     __shared__ float Bs[BK][BN + 1];
 
     int tx = threadIdx.x;  // 0..15
@@ -20,56 +22,90 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
     int blockRow = blockIdx.y * BM;
     int blockCol = blockIdx.x * BN;
 
-    int localRow = ty * TM;  // thread's starting row inside C tile
-    int localCol = tx * TN;  // thread's starting col inside C tile
+    int localRow = ty * TM;  // 0, 4, 8, ..., 60
+    int localCol = tx * TN;  // 0, 4, 8, ..., 60
 
     float acc[TM][TN];
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < TM; i++) {
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < TN; j++) {
             acc[i][j] = 0.0f;
         }
     }
 
     for (int k0 = 0; k0 < K; k0 += BK) {
-        // Load A tile: BM x BK = 64 x 16 = 1024 floats
-        // 256 threads, each loads 4 A elements
-        for (int idx = tid; idx < BM * BK; idx += blockDim.x * blockDim.y) {
-            int r = idx / BK;
-            int c = idx % BK;
-            As[r][c] = A[(blockRow + r) * K + (k0 + c)];
+        // ---------------------------------------------------------------------
+        // float4 load A tile
+        //
+        // A tile: BM x BK = 64 x 16 = 1024 floats
+        // float4 groups: 1024 / 4 = 256
+        // 256 threads => each thread loads exactly one float4
+        //
+        // A is row-major, so A[row][k0 + c ... k0 + c+3] is contiguous.
+        // ---------------------------------------------------------------------
+        {
+            int vecId = tid;               // 0..255
+            int r = vecId / (BK / 4);      // 0..63
+            int c4 = vecId % (BK / 4);     // 0..3
+            int c = c4 * 4;                // 0, 4, 8, 12
+
+            const float4 a4 = reinterpret_cast<const float4*>(
+                A + (blockRow + r) * K + (k0 + c)
+            )[0];
+
+            As[r][c + 0] = a4.x;
+            As[r][c + 1] = a4.y;
+            As[r][c + 2] = a4.z;
+            As[r][c + 3] = a4.w;
         }
 
-        // Load B tile: BK x BN = 16 x 64 = 1024 floats
-        // 256 threads, each loads 4 B elements
-        for (int idx = tid; idx < BK * BN; idx += blockDim.x * blockDim.y) {
-            int r = idx / BN;
-            int c = idx % BN;
-            Bs[r][c] = B[(k0 + r) * N + (blockCol + c)];
+        // ---------------------------------------------------------------------
+        // float4 load B tile
+        //
+        // B tile: BK x BN = 16 x 64 = 1024 floats
+        // float4 groups: 1024 / 4 = 256
+        // 256 threads => each thread loads exactly one float4
+        //
+        // B is row-major, so B[k0 + r][col ... col+3] is contiguous.
+        // ---------------------------------------------------------------------
+        {
+            int vecId = tid;               // 0..255
+            int r = vecId / (BN / 4);      // 0..15
+            int c4 = vecId % (BN / 4);     // 0..15
+            int c = c4 * 4;                // 0, 4, 8, ..., 60
+
+            const float4 b4 = reinterpret_cast<const float4*>(
+                B + (k0 + r) * N + (blockCol + c)
+            )[0];
+
+            Bs[r][c + 0] = b4.x;
+            Bs[r][c + 1] = b4.y;
+            Bs[r][c + 2] = b4.z;
+            Bs[r][c + 3] = b4.w;
         }
 
         __syncthreads();
 
-        #pragma unroll
+#pragma unroll
         for (int kk = 0; kk < BK; kk++) {
             float aFrag[TM];
             float bFrag[TN];
 
-            #pragma unroll
+#pragma unroll
             for (int i = 0; i < TM; i++) {
                 aFrag[i] = As[localRow + i][kk];
             }
 
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < TN; j++) {
                 bFrag[j] = Bs[kk][localCol + j];
             }
 
-            #pragma unroll
+#pragma unroll
             for (int i = 0; i < TM; i++) {
-                #pragma unroll
+#pragma unroll
                 for (int j = 0; j < TN; j++) {
                     acc[i][j] = fmaf(aFrag[i], bFrag[j], acc[i][j]);
                 }
@@ -82,9 +118,11 @@ __global__ void StudentKernel(int M, int N, int K, float alpha,
     int globalRow = blockRow + localRow;
     int globalCol = blockCol + localCol;
 
-    #pragma unroll
+    // 保持 V3 原本 scalar C store
+    // 先不要加入 float4 C load/store，這樣才能單獨測 A/B float4 load 的效果。
+#pragma unroll
     for (int i = 0; i < TM; i++) {
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < TN; j++) {
             int row = globalRow + i;
             int col = globalCol + j;
